@@ -1,13 +1,18 @@
 
 import streamlit as st
 import requests
-import html
 import io
+import time
+import random
+
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ---------------- PAGE SETTINGS ----------------
+
+# ==================================================
+# PAGE SETTINGS
+# ==================================================
 
 st.set_page_config(
     page_title="NOVA AI",
@@ -15,18 +20,24 @@ st.set_page_config(
     layout="wide"
 )
 
-MODEL = "gemini-3.8-flash"
-API_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/"
-    f"models/{MODEL}:generateContent"
+PRIMARY_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.6-flash"
+
+API_BASE = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
 )
 
-# ---------------- DESIGN ----------------
+
+# ==================================================
+# CUSTOM DESIGN
+# ==================================================
 
 st.markdown("""
 <style>
 .stApp {
-    background: linear-gradient(135deg, #080b1b, #15102d, #090d20);
+    background: linear-gradient(
+        135deg, #080b1b, #15102d, #090d20
+    );
     color: white;
 }
 
@@ -37,6 +48,7 @@ header[data-testid="stHeader"] {
 .block-container {
     max-width: 1050px;
     padding-top: 2rem;
+    padding-bottom: 3rem;
 }
 
 h1, h2, h3, p, label {
@@ -60,10 +72,12 @@ h1, h2, h3, p, label {
 
 .welcome {
     text-align: center;
-    padding: 28px 15px;
+    padding: 30px 15px;
     border: 1px solid #51448b;
     border-radius: 20px;
-    background: linear-gradient(135deg, #191735, #25204a);
+    background: linear-gradient(
+        135deg, #191735, #25204a
+    );
     margin-bottom: 25px;
 }
 
@@ -131,10 +145,14 @@ div[data-testid="stFileUploader"] {
     border-radius: 12px;
     padding: 10px;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- SESSION STATE ----------------
+
+# ==================================================
+# SESSION STATE
+# ==================================================
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -145,31 +163,46 @@ if "documents" not in st.session_state:
 if "pending_prompt" not in st.session_state:
     st.session_state.pending_prompt = None
 
-# ---------------- DOCUMENT FUNCTIONS ----------------
+
+# ==================================================
+# DOCUMENT PROCESSING
+# ==================================================
 
 def extract_text(uploaded_file):
-    name = uploaded_file.name.lower()
 
     try:
+        name = uploaded_file.name.lower()
+
         if name.endswith(".pdf"):
-            reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
+            reader = PdfReader(
+                io.BytesIO(uploaded_file.getvalue())
+            )
+
             return "\n".join(
                 page.extract_text() or ""
                 for page in reader.pages
             )
 
-        if name.endswith(".txt"):
+        elif name.endswith(".txt"):
             return uploaded_file.getvalue().decode(
-                "utf-8", errors="replace"
+                "utf-8",
+                errors="replace"
             )
 
     except Exception as error:
-        st.warning(f"Could not read {uploaded_file.name}: {error}")
+        st.warning(
+            f"Could not read {uploaded_file.name}: {error}"
+        )
 
     return ""
 
 
-def split_into_chunks(text, chunk_size=900, overlap=150):
+def split_into_chunks(
+    text,
+    chunk_size=900,
+    overlap=150
+):
+
     text = " ".join(text.split())
 
     if not text:
@@ -179,6 +212,7 @@ def split_into_chunks(text, chunk_size=900, overlap=150):
     start = 0
 
     while start < len(text):
+
         end = start + chunk_size
         chunks.append(text[start:end])
 
@@ -191,6 +225,7 @@ def split_into_chunks(text, chunk_size=900, overlap=150):
 
 
 def retrieve_context(question):
+
     chunks = st.session_state.documents
 
     if not chunks:
@@ -225,9 +260,98 @@ def retrieve_context(question):
         return ""
 
 
-# ---------------- GEMINI API ----------------
+# ==================================================
+# GEMINI API REQUEST
+# ==================================================
+
+def call_gemini(model, payload, api_key):
+
+    url = f"{API_BASE}{model}:generateContent"
+
+    for attempt in range(3):
+
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": api_key
+                },
+                json=payload,
+                timeout=60
+            )
+
+        except requests.exceptions.Timeout:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+
+            return None, "The request timed out."
+
+        except requests.exceptions.RequestException:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+
+            return None, "Could not connect to the AI service."
+
+        if response.status_code == 200:
+            try:
+                data = response.json()
+
+                candidates = data.get("candidates", [])
+
+                if not candidates:
+                    return None, "The model returned no answer."
+
+                parts = candidates[0].get(
+                    "content", {}
+                ).get("parts", [])
+
+                answer = "\n".join(
+                    part.get("text", "")
+                    for part in parts
+                    if part.get("text")
+                ).strip()
+
+                if answer:
+                    return answer, None
+
+                return None, "The model returned an empty answer."
+
+            except (ValueError, KeyError, TypeError):
+                return None, "The AI returned an unexpected response."
+
+        # Retry temporary server and rate-limit errors.
+        if response.status_code in (408, 429, 500, 502, 503, 504):
+
+            if attempt < 2:
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(delay)
+                continue
+
+            return None, f"Temporary API error {response.status_code}"
+
+        try:
+            detail = response.json().get(
+                "error", {}
+            ).get(
+                "message", "Unknown API error"
+            )
+        except Exception:
+            detail = "Unexpected API response."
+
+        return None, f"API error {response.status_code}: {detail}"
+
+    return None, "Please try again later."
+
+
+# ==================================================
+# NOVA ASSISTANT
+# ==================================================
 
 def ask_nova(question):
+
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
 
@@ -235,14 +359,17 @@ def ask_nova(question):
 
         if context:
             prompt = f"""
-Use the following document excerpts when they are relevant.
-If the answer is not present in the documents, clearly say so
-and then offer general help if appropriate.
+Use the following document excerpts when relevant.
+
+If the answer is not available in the documents,
+clearly say so. You can also provide general help.
 
 DOCUMENT EXCERPTS:
+
 {context}
 
 USER QUESTION:
+
 {question}
 """
         else:
@@ -250,23 +377,33 @@ USER QUESTION:
 
         system_instruction = """
 You are NOVA, a helpful, friendly and intelligent AI assistant.
-Give clear, accurate and useful answers.
-Use simple explanations when appropriate.
-When answering questions about uploaded documents,
-prioritize the supplied document excerpts.
-Do not claim to have read information that was not provided.
+
+Your responsibilities:
+
+1. Give clear and accurate answers.
+2. Explain difficult topics in simple language.
+3. Be friendly and respectful.
+4. Help with learning, writing, brainstorming and research.
+5. When documents are supplied, prioritize their contents.
+6. Never pretend to know information that was not provided.
 """
 
         contents = []
 
-        # Add earlier conversation, excluding the current question.
-        for message in st.session_state.messages[-10:]:
+        # Exclude the current question because it is added below.
+        previous_messages = st.session_state.messages[:-1]
+
+        for message in previous_messages[-10:]:
+
             contents.append({
                 "role": (
-                    "user" if message["role"] == "user"
+                    "user"
+                    if message["role"] == "user"
                     else "model"
                 ),
-                "parts": [{"text": message["content"]}]
+                "parts": [
+                    {"text": message["content"]}
+                ]
             })
 
         contents.append({
@@ -276,74 +413,65 @@ Do not claim to have read information that was not provided.
 
         payload = {
             "system_instruction": {
-                "parts": [{"text": system_instruction}]
+                "parts": [
+                    {"text": system_instruction}
+                ]
             },
             "contents": contents,
             "generationConfig": {
-                "temperature": 0.7,
                 "maxOutputTokens": 1500
             }
         }
 
-        response = requests.post(
-            API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key
-            },
-            json=payload,
-            timeout=60
+        # First try the primary model.
+        answer, error = call_gemini(
+            PRIMARY_MODEL,
+            payload,
+            api_key
         )
 
-        if response.status_code != 200:
-            try:
-                detail = response.json().get("error", {}).get(
-                    "message", "Unknown API error"
-                )
-            except Exception:
-                detail = "The API returned an unexpected response."
+        if answer:
+            return answer
 
-            return (
-                f"NOVA could not get a response. "
-                f"API error {response.status_code}: {detail}"
+        # Try the fallback model after temporary overload.
+        if error and error.startswith("Temporary API error"):
+
+            answer, fallback_error = call_gemini(
+                FALLBACK_MODEL,
+                payload,
+                api_key
             )
 
-        data = response.json()
+            if answer:
+                return answer
 
-        candidates = data.get("candidates", [])
+            return (
+                "NOVA is temporarily experiencing high demand. "
+                "Both available models are busy. "
+                "Please wait a little and try again."
+            )
 
-        if not candidates:
-            return "NOVA couldn't generate an answer. Please try again."
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-
-        answer = "\n".join(
-            part.get("text", "")
-            for part in parts
-            if part.get("text")
-        ).strip()
-
-        return answer or "NOVA returned an empty response. Please try again."
+        return error or "NOVA couldn't generate an answer."
 
     except KeyError:
         return (
-            "The GEMINI_API_KEY secret is missing. "
-            "Please check your Streamlit app secrets."
+            "GEMINI_API_KEY is missing. "
+            "Please check Streamlit Secrets."
         )
 
-    except requests.exceptions.Timeout:
-        return "The request timed out. Please try again."
-
-    except requests.exceptions.RequestException:
-        return "Could not connect to the AI service. Please try again."
-
-    except Exception as error:
-        return f"Something went wrong: {error}"
+    except Exception:
+        return (
+            "Something went wrong. "
+            "Please try asking your question again."
+        )
 
 
-# ---------------- SIDEBAR ----------------
+# ==================================================
+# SIDEBAR
+# ==================================================
 
 with st.sidebar:
+
     st.markdown("## ✦ NOVA AI")
     st.caption("Your intelligent assistant")
 
@@ -358,12 +486,18 @@ with st.sidebar:
     )
 
     if uploaded_files:
+
         if st.button("Process uploaded documents"):
+
             all_chunks = []
 
             for uploaded_file in uploaded_files:
+
                 extracted = extract_text(uploaded_file)
-                all_chunks.extend(split_into_chunks(extracted))
+
+                all_chunks.extend(
+                    split_into_chunks(extracted)
+                )
 
             st.session_state.documents = all_chunks
 
@@ -380,16 +514,22 @@ with st.sidebar:
     st.divider()
 
     if st.button("＋ New conversation"):
+
         st.session_state.messages = []
         st.session_state.pending_prompt = None
+
         st.rerun()
 
     if st.button("Clear documents"):
+
         st.session_state.documents = []
-        st.rerun()
+
+        st.success("Documents cleared.")
 
 
-# ---------------- HOME SCREEN ----------------
+# ==================================================
+# MAIN HOME SCREEN
+# ==================================================
 
 st.markdown(
     '<div class="nova-title">✦ NOVA AI</div>',
@@ -403,11 +543,20 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+
+# ==================================================
+# WELCOME GREETING AND SUGGESTED QUESTIONS
+# ==================================================
+
 if not st.session_state.messages:
+
     st.markdown("""
     <div class="welcome">
         <h2>Hello Samiksha! ✨</h2>
-        <p>Welcome to NOVA AI. What would you like to explore today?</p>
+        <p>
+            Welcome to NOVA AI.
+            What would you like to explore today?
+        </p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -423,23 +572,37 @@ if not st.session_state.messages:
     columns = st.columns(2)
 
     for index, suggestion in enumerate(suggestions):
+
         with columns[index % 2]:
-            if st.button(suggestion, key=f"suggestion_{index}"):
+
+            if st.button(
+                suggestion,
+                key=f"suggestion_{index}"
+            ):
+
                 st.session_state.pending_prompt = suggestion
                 st.rerun()
 
 
-# ---------------- CHAT HISTORY ----------------
+# ==================================================
+# DISPLAY CHAT HISTORY
+# ==================================================
 
 for message in st.session_state.messages:
-    # No custom avatar argument: avoids the avatar media-file error.
+
+    # No custom avatar: prevents avatar media-file errors.
     with st.chat_message(message["role"]):
+
         st.markdown(message["content"])
 
 
-# ---------------- CHAT INPUT ----------------
+# ==================================================
+# CHAT INPUT
+# ==================================================
 
-typed_question = st.chat_input("Ask NOVA anything...")
+typed_question = st.chat_input(
+    "Ask NOVA anything..."
+)
 
 question = (
     st.session_state.pending_prompt
@@ -447,6 +610,7 @@ question = (
 )
 
 if question:
+
     st.session_state.pending_prompt = None
 
     st.session_state.messages.append({
@@ -458,7 +622,9 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
+
         with st.spinner("NOVA is thinking..."):
+
             answer = ask_nova(question)
 
         st.markdown(answer)
